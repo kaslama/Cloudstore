@@ -1,123 +1,78 @@
 <?php
 session_start();
-require_once 'config/db.php';
+require_once __DIR__ . '/config/db.php';
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    // Only accept POST uploads
+    header('Location: dashboard.php');
+    exit();
+}
 
 if (!isset($_SESSION['user_id'])) {
     header('Location: auth/login.php');
     exit();
 }
 
-$message = "";
+$user_id = $_SESSION['user_id'];
 
-// Handle folder creation
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_folder']) && !empty(trim($_POST['folder_name']))) {
-    $folderName = trim($_POST['folder_name']);
-    $uploadDir = __DIR__ . "/uploads/$folderName";
+$messages = [];
 
-    if (!file_exists($uploadDir)) {
-        mkdir($uploadDir, 0777, true);
-        $message = "✅ Folder '$folderName' created successfully.";
-    } else {
-        $message = "⚠️ Folder already exists.";
-    }
-}
-
-// Handle file upload with hash check
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
-    $user_id = $_SESSION['user_id'];
-    $folder = isset($_POST['target_folder']) ? trim($_POST['target_folder']) : '';
-    $uploadDir = __DIR__ . '/uploads/' . $folder;
-
-    if (!file_exists($uploadDir)) {
-        mkdir($uploadDir, 0777, true);
-    }
-
+if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+    $messages[] = "❌ No file uploaded or upload error.";
+} else {
     $file = $_FILES['file'];
 
-    if ($file['error'] === UPLOAD_ERR_OK) {
-        $originalName = basename($file['name']);
-        $tempPath = $file['tmp_name'];
-        $fileSize = $file['size'];
-        $fileHash = md5_file($tempPath); // ← Generate file hash
+    $originalName = $file['name'];
+    $tmpName = $file['tmp_name'];
+    $fileSize = $file['size'];
+    $folder_id = !empty($_POST['folder_id']) ? intval($_POST['folder_id']) : null;
 
-        // Check if file with same hash already exists
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM files WHERE file_hash = ?");
-        $stmt->execute([$fileHash]);
-        $count = $stmt->fetchColumn();
+    $fileHash = md5_file($tmpName);
 
-        if ($count > 0) {
-            $message = "⚠️ Duplicate file. A file with the same content already exists.";
-        } else {
-            $newFileName = uniqid('file_') . '_' . $originalName;
-            $destPath = $uploadDir . '/' . $newFileName;
+    // Check for duplicates
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM files WHERE user_id = ? AND file_hash = ? AND is_deleted = 0");
+    $stmt->execute([$user_id, $fileHash]);
+    $duplicateCount = $stmt->fetchColumn();
 
-            if (move_uploaded_file($tempPath, $destPath)) {
-                // Insert file data with hash
-                $stmt = $pdo->prepare("INSERT INTO files (user_id, original_name, file_path, file_size, uploaded_at, folder, file_hash) VALUES (?, ?, ?, ?, NOW(), ?, ?)");
-                $stmt->execute([$user_id, $originalName, "$folder/$newFileName", $fileSize, $folder, $fileHash]);
-
-                $_SESSION['message'] = "✅ File uploaded to '$folder'!";
-                header("Location: " . $_SERVER['PHP_SELF']);
-                exit();
-            } else {
-                $message = "❌ Failed to move uploaded file.";
-            }
-        }
+    if ($duplicateCount > 0) {
+        $messages[] = "⚠️ Duplicate file detected. This file already exists.";
     } else {
-        $message = "❌ Upload error: " . $file['error'];
+        $safeName = preg_replace("/[^a-zA-Z0-9\.\-_]/", "_", $originalName);
+        $uploadDir = __DIR__ . '/uploads/user_' . $user_id . '/';
+        if (!is_dir($uploadDir)) {
+            mkdir($uploadDir, 0755, true);
+        }
+
+        $baseName = pathinfo($safeName, PATHINFO_FILENAME);
+        $extension = pathinfo($safeName, PATHINFO_EXTENSION);
+
+        $version = 0;
+        do {
+            $newFileName = time() . '_' . $baseName . ($version > 0 ? "_v$version" : '') . '.' . $extension;
+            $destPath = $uploadDir . $newFileName;
+
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM files WHERE user_id = ? AND file_path = ?");
+            $stmt->execute([$user_id, "user_$user_id/$newFileName"]);
+            $count = $stmt->fetchColumn();
+
+            $version++;
+        } while ($count > 0);
+
+        if (move_uploaded_file($tmpName, $destPath)) {
+            $relativePath = "user_$user_id/$newFileName";
+
+            $stmt = $pdo->prepare("INSERT INTO files (user_id, original_name, file_path, file_size, uploaded_at, version, is_deleted, folder_id, file_hash) VALUES (?, ?, ?, ?, NOW(), ?, 0, ?, ?)");
+            $stmt->execute([$user_id, $originalName, $relativePath, $fileSize, 1, $folder_id, $fileHash]);
+
+            $messages[] = "✅ File uploaded successfully!";
+        } else {
+            $messages[] = "❌ Failed to move uploaded file.";
+        }
     }
 }
 
-// Show session message
-if (isset($_SESSION['message'])) {
-    $message = $_SESSION['message'];
-    unset($_SESSION['message']);
-}
+$_SESSION['message'] = implode("<br>", array_filter($messages, fn($m) => str_starts_with($m, "✅")));
+$_SESSION['error'] = implode("<br>", array_filter($messages, fn($m) => str_starts_with($m, "❌") || str_starts_with($m, "⚠️")));
 
-// List folders in /uploads
-$uploadBase = __DIR__ . '/uploads';
-$folders = array_filter(glob($uploadBase . '/*'), 'is_dir');
-$folderNames = array_map('basename', $folders);
-?>
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <title>Upload File to Folder</title>
-</head>
-<body>
-    <h2>📂 Upload File to Folder</h2>
-
-    <?php if ($message): ?>
-        <p><?= htmlspecialchars($message) ?></p>
-    <?php endif; ?>
-
-    <form method="POST" enctype="multipart/form-data" id="uploadForm">
-        <label>Select Folder:</label>
-        <select name="target_folder" required>
-            <option value="" disabled selected>-- Choose a folder --</option>
-            <?php foreach ($folderNames as $fname): ?>
-                <option value="<?= htmlspecialchars($fname) ?>"><?= htmlspecialchars($fname) ?></option>
-            <?php endforeach; ?>
-        </select><br><br>
-
-        <input type="file" name="file" required />
-        <button type="submit" id="uploadBtn">Upload</button>
-    </form>
-
-    <h3>📁 Create New Folder</h3>
-    <form method="POST">
-        <input type="text" name="folder_name" placeholder="New folder name" required />
-        <button type="submit" name="create_folder">Create Folder</button>
-    </form>
-
-    <br><a href="dashboard.php">🔙 Go to Dashboard</a>
-
-    <script>
-        document.getElementById('uploadForm').addEventListener('submit', function () {
-            document.getElementById('uploadBtn').disabled = true;
-        });
-    </script>
-</body>
-</html>
+header('Location:dashboard.php');
+exit();
